@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+gar_tool : extraction et recompilation des archives Grezzo 3DS (.gar / .zar / .lzs).
+
+  python3 gar_tool.py extract romfs/ extrait/
+  python3 gar_tool.py repack  romfs/ extrait/ mod/
+
+extract : décompresse les LzS, ouvre les GAR (récursivement) et écrit un
+          _manifest.json dans chaque dossier d'archive.
+repack  : relit les fichiers de extrait/, les compare à l'original et, pour
+          chaque archive modifiée, réécrit les fichiers changés à leur offset
+          d'origine puis recompresse en LzS si besoin. Seules les archives
+          modifiées sont écrites dans mod/, avec l'arborescence du RomFS :
+          copie mod/ dans /luma/titles/<TitleID>/romfs/ (LayeredFS).
+
+Un fichier de même taille est réécrit à son offset d'origine. Si sa taille
+change (fichier agrandi, ou sous-archive recompressée), l'archive est
+reconstruite : fichiers recalés avec l'alignement d'origine, tables de
+tailles/offsets et taille totale mises à jour.
+
+Formats repris de Switch Toolbox (GAR.cs, LZSS.cs).
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+MANIFEST = "_manifest.json"
+
+
+# ====================== LzS ======================
+
+def lzs_decompress(data: bytes) -> bytes:
+    if data[:4] != b"LzS\x01":
+        raise ValueError("pas un fichier LzS")
+    _unk, dec_size, comp_size = struct.unpack_from("<III", data, 4)
+    if len(data) < comp_size + 0x10:
+        raise ValueError("fichier LzS tronqué")
+    out = bytearray()
+    buf = bytearray(4096)
+    w, i, end = 0xFEE, 0x10, 0x10 + comp_size
+    while i < end and len(out) < dec_size:
+        flags = data[i]
+        i += 1
+        for _ in range(8):
+            if i >= end or len(out) >= dec_size:
+                break
+            if flags & 1:
+                b = data[i]
+                i += 1
+                out.append(b)
+                buf[w] = b
+                w = (w + 1) & 0xFFF
+            else:
+                b1, b2 = data[i], data[i + 1]
+                i += 2
+                r = b1 | ((b2 & 0xF0) << 4)
+                for _ in range((b2 & 0x0F) + 3):
+                    b = buf[r]
+                    out.append(b)
+                    buf[w] = b
+                    r = (r + 1) & 0xFFF
+                    w = (w + 1) & 0xFFF
+            flags >>= 1
+    if len(out) != dec_size:
+        raise ValueError(f"taille décompressée {len(out)} != {dec_size} attendue")
+    return bytes(out)
+
+
+def lzs_compress(data: bytes, unk: int = 0) -> bytes:
+    """LZSS glouton compatible avec lzs_decompress (fenêtre 4 Ko, longueurs 3..18)."""
+    WINDOW, MIN_LEN, MAX_LEN, MAX_CAND = 4096 - MAX_LEN_PAD, 3, 18, 64
+    n = len(data)
+    out = bytearray()
+    table = {}  # préfixe de 3 octets -> positions récentes
+    p = 0
+    while p < n:
+        flag_pos = len(out)
+        out.append(0)
+        flags = 0
+        for bit in range(8):
+            if p >= n:
+                break
+            best_len, best_pos = 0, 0
+            if p + MIN_LEN <= n:
+                cands = table.get(data[p:p + 3], ())
+                for j in reversed(cands):
+                    if p - j > WINDOW:
+                        break
+                    l = 0
+                    lim = min(MAX_LEN, n - p)
+                    while l < lim and data[j + l] == data[p + l]:
+                        l += 1
+                    if l > best_len:
+                        best_len, best_pos = l, j
+                        if l == MAX_LEN:
+                            break
+            step = best_len if best_len >= MIN_LEN else 1
+            if step == 1:
+                flags |= 1 << bit
+                out.append(data[p])
+            else:
+                r = (0xFEE + best_pos) & 0xFFF
+                out.append(r & 0xFF)
+                out.append(((r >> 4) & 0xF0) | (best_len - 3))
+            for k in range(p, p + step):
+                if k + 3 <= n:
+                    lst = table.setdefault(data[k:k + 3], [])
+                    lst.append(k)
+                    if len(lst) > MAX_CAND:
+                        del lst[0]
+            p += step
+        out[flag_pos] = flags
+    return b"LzS\x01" + struct.pack("<III", unk, n, len(out)) + bytes(out)
+
+
+MAX_LEN_PAD = 18  # marge pour que la source d'une copie ne soit jamais écrasée
+
+
+# ====================== GAR ======================
+
+def read_cstr(data: bytes, off: int) -> str:
+    end = data.index(b"\0", off)
+    return data[off:end].decode("ascii", errors="replace")
+
+
+def safe_name(name: str) -> str:
+    name = name.replace("\\", "/")
+    parts = [p for p in name.split("/") if p not in ("", ".", "..")]
+    return "/".join(parts) or "sans_nom"
+
+
+def gar_parse(data: bytes):
+    """Renvoie (codename, [(nom, offset, taille, pos_champ_taille, pos_champ_offset)])."""
+    magic = data[:4]
+    if magic[:3] not in (b"GAR", b"ZAR"):
+        raise ValueError(f"magic inconnu {magic!r}")
+    (_fsize, group_count, file_count,
+     group_off, info_off, data_off) = struct.unpack_from("<IHHIII", data, 4)
+    codename = data[0x18:0x20].rstrip(b"\0").decode("ascii", errors="replace")
+    entries = []
+
+    if codename in ("agora", "SYSTEM"):           # Ever Oasis, LM3DS
+        groupes, pos = [], group_off
+        for _ in range(group_count):
+            count, _u, _i, name_off, _s = struct.unpack_from("<IIIII", data, pos)
+            groupes.append((count, read_cstr(data, name_off)))
+            pos = (pos + 0x14 + 0x1F) & ~0x1F
+        pos = info_off
+        for count, ext in groupes:
+            for _ in range(count):
+                size, off, name_off, _p = struct.unpack_from("<IIII", data, pos)
+                entries.append((f"{read_cstr(data, name_off)}.{ext}", off, size, pos, pos + 4))
+                pos += 0x10
+
+    elif codename in ("queen", "jenkins"):         # OoT3D, MM3D
+        counts, pos = [], group_off
+        for _ in range(group_count):
+            counts.append(struct.unpack_from("<I", data, pos)[0])
+            pos += 0x10
+        infos, pos = [], info_off
+        zar = magic == b"ZAR\x01"
+        for c in counts:
+            for _ in range(c):
+                if zar:
+                    size, n = struct.unpack_from("<II", data, pos)
+                    infos.append((size, read_cstr(data, n), pos))
+                    pos += 8
+                else:
+                    size, _n1, n = struct.unpack_from("<III", data, pos)
+                    infos.append((size, read_cstr(data, n), pos))
+                    pos += 12
+        offsets = struct.unpack_from(f"<{file_count}I", data, data_off)
+        entries = [(nom, off, size, spos, data_off + 4 * k)
+                   for k, ((size, nom, spos), off) in enumerate(zip(infos, offsets))]
+    else:
+        raise ValueError(f"codename inconnu {codename!r}")
+
+    for nom, off, size, _a, _b in entries:
+        if off + size > len(data):
+            raise ValueError(f"{nom} dépasse la fin de l'archive")
+    return codename, entries
+
+
+def is_archive(b: bytes) -> bool:
+    return b[:3] in (b"GAR", b"ZAR") or b[:4] == b"LzS\x01"
+
+
+# ====================== extract ======================
+
+def extract(raw: bytes, dest: Path, stats: dict):
+    lzs = raw[:4] == b"LzS\x01"
+    data = lzs_decompress(raw) if lzs else raw
+    if data[:3] not in (b"GAR", b"ZAR"):
+        raise ValueError("LzS ne contenant pas de GAR")
+    codename, entries = gar_parse(data)
+    stats["archives"] += 1
+    stats["codenames"].add(codename)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    manifest = {"lzs": lzs, "codename": codename, "entries": []}
+    used = set()
+    for nom, off, size, _a, _b in entries:
+        rel = safe_name(nom)
+        while rel in used:                      # noms en double
+            rel += "_dup"
+        used.add(rel)
+        contenu = data[off:off + size]
+        nested = False
+        if is_archive(contenu):
+            try:
+                extract(contenu, dest / (rel + "_x"), stats)
+                nested = True
+            except Exception as e:
+                print(f"  [!] {dest / rel} : {e} (écrit brut)")
+        if not nested:
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            (dest / rel).write_bytes(contenu)
+            stats["fichiers"] += 1
+        manifest["entries"].append(
+            {"nom": nom, "chemin": rel + ("_x" if nested else ""),
+             "offset": off, "taille": size, "archive": nested})
+    (dest / MANIFEST).write_text(json.dumps(manifest, indent=1, ensure_ascii=False))
+
+
+# ====================== repack ======================
+
+def gar_relayout(data: bytes, nouveaux: dict) -> bytes:
+    """Reconstruit le GAR en replaçant les fichiers dont la taille a changé.
+    nouveaux : {index_entree: octets}. Les tables et l'en-tête sont mis à jour."""
+    _code, entries = gar_parse(data)
+    debut = min((e[1] for e in entries if e[2] > 0), default=len(data))
+    # alignement d'origine : plus grande puissance de 2 divisant tous les offsets
+    align = 0x80
+    while align > 1 and any(e[1] % align for e in entries if e[2] > 0):
+        align //= 2
+    out = bytearray(data[:debut])
+    ordre = sorted(range(len(entries)), key=lambda k: entries[k][1])
+    for k in ordre:
+        nom, off, size, spos, opos = entries[k]
+        contenu = nouveaux.get(k, data[off:off + size])
+        if size == 0 and k not in nouveaux:
+            continue
+        out += b"\0" * ((-len(out)) % align)
+        struct.pack_into("<I", out, opos, len(out))
+        struct.pack_into("<I", out, spos, len(contenu))
+        out += contenu
+    out += b"\0" * ((-len(out)) % align)
+    struct.pack_into("<I", out, 4, len(out))      # taille totale dans l'en-tête
+    return bytes(out)
+
+
+def rebuild(raw: bytes, dossier: Path, label: str, journal: list) -> bytes:
+    """Renvoie la nouvelle version de l'archive (raw si rien n'a changé)."""
+    man = json.loads((dossier / MANIFEST).read_text())
+    data = bytearray(lzs_decompress(raw) if man["lzs"] else raw)
+    change = False
+    redim = {}
+    for idx, e in enumerate(man["entries"]):
+        off, size = e["offset"], e["taille"]
+        orig = bytes(data[off:off + size])
+        chemin = dossier / e["chemin"]
+        if e["archive"]:
+            nouveau = rebuild(orig, chemin, f"{label}/{e['nom']}", journal)
+        else:
+            nouveau = chemin.read_bytes()
+        if nouveau == orig:
+            continue
+        change = True
+        if len(nouveau) != size:
+            redim[idx] = nouveau
+        else:
+            data[off:off + size] = nouveau
+        if not e["archive"]:
+            journal.append(f"{label}/{e['nom']}")
+    if not change:
+        return raw
+    if redim:
+        data = bytearray(gar_relayout(bytes(data), redim))
+        _c, verif = gar_parse(bytes(data))       # contrôle de cohérence
+        assert len(verif) == len(man["entries"])
+    if man["lzs"]:
+        unk = struct.unpack_from("<I", raw, 4)[0]
+        packed = lzs_compress(bytes(data), unk)
+        assert lzs_decompress(packed) == bytes(data), "erreur de recompression"
+        return packed
+    return bytes(data)
+
+
+def repack(src: Path, extrait: Path, out: Path):
+    n_ok, n_err = 0, 0
+    for man in sorted(extrait.rglob(MANIFEST)):
+        dossier = man.parent
+        # on ne traite que les archives de premier niveau (dossier "xxx.gar_x"
+        # correspondant à un fichier du RomFS)
+        rel = dossier.relative_to(extrait)
+        orig = src / rel.parent / rel.name[:-2]
+        if not rel.name.endswith("_x") or not orig.is_file():
+            continue
+        journal = []
+        try:
+            raw = orig.read_bytes()
+            nouveau = rebuild(raw, dossier, str(rel.parent / rel.name[:-2]), journal)
+        except Exception as e:
+            print(f"[ERREUR] {rel.parent / rel.name[:-2]} : {e}")
+            n_err += 1
+            continue
+        if nouveau is raw:
+            continue
+        cible = out / rel.parent / rel.name[:-2]
+        cible.parent.mkdir(parents=True, exist_ok=True)
+        cible.write_bytes(nouveau)
+        n_ok += 1
+        for j in journal:
+            print(f"  modifié : {j}")
+        print(f"-> {cible}")
+    print(f"\n{n_ok} archive(s) recompilée(s), {n_err} erreur(s).")
+    if n_ok:
+        print(f"Copie le contenu de {out}/ dans /luma/titles/<TitleID>/romfs/")
+
+
+# ====================== CLI ======================
+
+def parse_args(argv):
+    """Sépare l'option -o/--output des autres arguments."""
+    out, rest, i = None, [], 0
+    while i < len(argv):
+        if argv[i] in ("-o", "--output"):
+            if i + 1 >= len(argv):
+                sys.exit("erreur : -o attend un chemin")
+            out = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    return rest, out
+
+
+def sortie_defaut(src: Path, ext: str) -> Path:
+    """Sortie par défaut dans le dossier courant : fichier -> nom.ext, dossier -> nom_ext/"""
+    if src.is_dir():
+        return Path.cwd() / f"{src.resolve().name}_{ext.lstrip('.')}"
+    return Path.cwd() / (src.stem + ext)
+
+def main():
+    a, out = parse_args(sys.argv[1:])
+    if len(a) == 2 and a[0] == "extract":
+        src = Path(a[1])
+        # fichier -> ./nom.gar_x/ ; dossier -> ./nom_x/
+        racine = Path(out) if out else (Path.cwd() if src.is_file() else sortie_defaut(src, "x"))
+        cibles = [src] if src.is_file() else sorted(
+            p for p in src.rglob("*")
+            if p.is_file() and p.suffix.lower() in (".gar", ".zar", ".lzs"))
+        stats = {"archives": 0, "fichiers": 0, "erreurs": 0, "codenames": set()}
+        for f in cibles:
+            rel = f.relative_to(src) if src.is_dir() else Path(f.name)
+            try:
+                extract(f.read_bytes(), racine / rel.parent / (rel.name + "_x"), stats)
+            except Exception as e:
+                stats["erreurs"] += 1
+                print(f"[ERREUR] {rel} : {e}")
+        print(f"\n{stats['archives']} archives, {stats['fichiers']} fichiers, "
+              f"{stats['erreurs']} erreurs. Codenames : {sorted(stats['codenames'])}")
+        print(f"Sortie : {racine}")
+    elif len(a) == 3 and a[0] == "repack":
+        src, extrait = Path(a[1]), Path(a[2])
+        repack(src, extrait, Path(out) if out else sortie_defaut(extrait, "mod"))
+    else:
+        print(__doc__)
+        print("Option : -o CHEMIN  (sinon : dossier courant)")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

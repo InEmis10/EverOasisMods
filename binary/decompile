@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+"""
+gsb_decompile : décompile les .gsb d'Ever Oasis (bytecode Squirrel 2.2) en code
+Squirrel lisible (.nut).
+
+  python3 gsb_decompile.py VendorNpc.gsb              # affiche le code
+  python3 gsb_decompile.py VendorNpc.gsb out.nut      # écrit dans un fichier
+  python3 gsb_decompile.py extrait/ sources/          # tout un dossier
+
+Reconstruit : classes (extends), méthodes, fonctions globales, variables locales,
+appels, tableaux, if / else if / else, while, do-while, switch/case/default,
+break/continue, && ||, opérateurs, ++/--, ternaires.
+Quand un bout de bytecode ne correspond à aucun motif connu, le décompilateur
+n'invente rien : il laisse un commentaire /* ... */ avec l'instruction brute.
+
+Nécessite gsb_asm.py dans le même dossier (lecture du format).
+"""
+import re
+import struct
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from asm import lire_gsb, OPCODES  # noqa: E402
+
+KEYWORDS = {
+    "while", "do", "if", "else", "break", "continue", "return", "null", "function",
+    "for", "foreach", "in", "typeof", "base", "delete", "try", "catch", "throw",
+    "clone", "yield", "resume", "switch", "case", "default", "this", "parent",
+    "class", "extends", "constructor", "instanceof", "vargc", "vargv", "true",
+    "false", "static", "local", "enum", "const",
+}
+ARITH_OPS = {43: "+", 45: "-", 42: "*", 47: "/", 37: "%"}
+BITW_OPS = {0: "&", 2: "|", 3: "^", 4: "<<", 5: ">>", 6: ">>>"}
+CMP_OPS = {0: ">", 2: ">=", 3: "<", 4: "<="}
+JUMPS = {"JMP", "JZ", "JNZ"}
+
+
+def ident(s):
+    return isinstance(s, str) and re.fullmatch(r"[A-Za-z_]\w*", s) and s not in KEYWORDS
+
+
+def sq_str(b: bytes) -> str:
+    try:
+        s = b.decode("utf-8")
+    except UnicodeDecodeError:
+        # Shift-JIS (debug japonais) : octets conservés à l'identique via \xNN
+        # (le lexer Squirrel lit jusqu'à 4 chiffres hexa : on échappe aussi
+        #  un chiffre hexa qui suivrait un \xNN)
+        out, prev_esc = [], False
+        for byte in b:
+            c = chr(byte)
+            if byte >= 0x80 or byte < 32 or (prev_esc and c in "0123456789abcdefABCDEF"):
+                out.append(f"\\x{byte:02x}")
+                prev_esc = True
+                continue
+            prev_esc = False
+            out.append({"\\": "\\\\", '"': '\\"'}.get(c, c))
+        lisible = b.decode("shift_jis", "replace").replace("*/", "*_/")
+        return '"' + "".join(out) + f'" /* {lisible} */'
+    out = []
+    for c in s:
+        if c == "\\":
+            out.append("\\\\")
+        elif c == '"':
+            out.append('\\"')
+        elif c == "\n":
+            out.append("\\n")
+        elif c == "\t":
+            out.append("\\t")
+        elif c == "\r":
+            out.append("\\r")
+        elif ord(c) < 32:
+            out.append(f"\\x{ord(c):02x}")
+        else:
+            out.append(c)
+    return '"' + "".join(out) + '"'
+
+
+def fmt_float(bits: int) -> str:
+    v = struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
+    for p in range(1, 10):
+        s = f"{v:.{p}g}"
+        if struct.unpack("<f", struct.pack("<f", float(s)))[0] == v:
+            s = repr(float(s))
+            break
+    if "e" in s and abs(v) < 1e15:
+        s = f"{v:.12f}".rstrip("0")
+        s += "0" if s.endswith(".") else ""
+    return s
+
+
+PREC = {"||": 1, "&&": 2, "|": 3, "^": 4, "&": 5, "==": 6, "!=": 6,
+        "<": 7, "<=": 7, ">": 7, ">=": 7, "in": 7, "instanceof": 7,
+        "<<": 8, ">>": 8, ">>>": 8, "+": 9, "-": 9, "*": 10, "/": 10, "%": 10}
+
+
+class E:
+    """Expression. prec = priorité de l'opérateur principal (100 = atome)."""
+    __slots__ = ("t", "prec", "kind", "meta", "side")
+
+    def __init__(self, t, atom=True, kind="", meta=None, side=False, prec=None):
+        self.t, self.kind, self.meta, self.side = t, kind, meta, side
+        self.prec = prec if prec is not None else (100 if atom else 0)
+
+    @property
+    def atom(self):
+        return self.prec >= 100
+
+    def p(self, need=100):
+        return self.t if self.prec >= need else f"({self.t})"
+
+
+def binop(a, op, b, **kw):
+    P = PREC[op]
+    if op in ("&&", "||"):
+        return E(f"{a.p(P + 1)} {op} {b.p(P)}", prec=P, **kw)
+    return E(f"{a.p(P)} {op} {b.p(P + 1)}", prec=P, **kw)
+
+
+THIS = E("this", kind="this")
+ROOT = E("::", kind="root")
+
+
+def lit_expr(o) -> E:
+    k = o[0]
+    if k == "str":
+        try:
+            raw = o[1].decode("utf-8")
+        except UnicodeDecodeError:
+            raw = None
+        return E(sq_str(o[1]), kind="str", meta=raw)
+    if k == "int":
+        if o[1] < 0:  # LOAD d'un entier négatif = constante hexadécimale dans le source
+            return E(f"0x{o[1] & 0xFFFFFFFF:08X} /* {o[1]} */", kind="int", meta=o[1])
+        return E(str(o[1]), atom=True, kind="int", meta=o[1])
+    if k == "float":
+        return E(fmt_float(o[1]), kind="float")
+    if k == "bool":
+        return E("true" if o[1] else "false")
+    return E("null")
+
+
+class Decomp:
+    def __init__(self, fn: dict, name: str):
+        self.fn = fn
+        self.name = name
+        self.code = fn["code"]
+        self.ops = [OPCODES[c[0]] if c[0] < len(OPCODES) else f"OP_{c[0]}" for c in self.code]
+        self.lits = fn["lit"]
+        self.params = [p[1].decode() if p[0] == "str" else "?" for p in fn["param"]]
+        self.locals = []  # (nom, reg, start, end)
+        for n, reg, st, en in fn["local"]:
+            nom = n[1].decode("utf-8", "replace") if n[0] == "str" else f"l{reg}"
+            self.locals.append((nom, reg, st, en))
+        self.regs = {}
+        self.wrapped = set()
+        self.pending = []  # registres contenant une expression à effet de bord non consommée
+        # têtes de boucle : cible d'un saut arrière -> index du dernier saut arrière
+        self.loops = {}
+        for i, (op, a0, a1, a2, a3) in enumerate(self.code):
+            if self.ops[i] in ("JMP", "JNZ") and a1 < 0:
+                t = i + 1 + a1
+                self.loops[t] = max(self.loops.get(t, -1), i)
+
+    # ---------- variables ----------
+    def local_at(self, reg, pc):
+        best = None
+        for nom, r, st, en in self.locals:
+            if r == reg and st <= pc <= en and (best is None or st >= best[2]):
+                best = (nom, r, st, en)
+        return best
+
+    def is_param(self, nom):
+        return nom in self.params
+
+    def tgt(self, ins_idx, off):
+        return ins_idx + 1 + off
+
+    # ---------- registres ----------
+    def read(self, r, pc) -> E:
+        loc = self.local_at(r, pc)
+        if loc:
+            if loc[0] == "this":
+                return THIS
+            return E(loc[0], kind="local", meta=r)
+        e = self.regs.get(r)
+        if r in self.pending:
+            self.pending.remove(r)
+        if e is None:
+            if r == 0:
+                return THIS
+            return E(f"r{r}")
+        return e
+
+    def peek(self, r, pc):
+        loc = self.local_at(r, pc)
+        if loc:
+            return THIS if loc[0] == "this" else E(loc[0], kind="local", meta=r)
+        return self.regs.get(r, E(f"r{r}"))
+
+    def flush(self, out, upto=None):
+        while self.pending:
+            r = self.pending.pop(0)
+            e = self.regs.get(r)
+            if e is not None:
+                out.append(("line", e.t + ";"))
+            if r == upto:
+                break
+
+    def emit(self, out, stmt):
+        self.flush(out)
+        out.append(stmt)
+
+    def write(self, r, e: E, pc, out):
+        loc = self.local_at(r, pc)
+        if loc and loc[0] != "this":
+            self.emit(out, ("line", f"{loc[0]} = {e.t};"))
+            return
+        if r in self.pending:
+            self.flush(out, upto=r)
+        self.regs[r] = e
+        if e.side:
+            self.pending.append(r)
+
+    # ---------- expressions ----------
+    def member(self, obj: E, key: E, pc) -> E:
+        name = key.meta if key.kind == "str" else None
+        if name and ident(name):
+            if obj.kind == "this":
+                shadow = any(n == name and st <= pc <= en for n, _, st, en in self.locals)
+                return E(f"this.{name}" if shadow else name)
+            if obj.kind == "root":
+                return E(f"::{name}")
+            return E(f"{obj.p()}.{name}")
+        if obj.kind == "root":
+            return E(f"::[{key.t}]")
+        return E(f"{obj.p()}[{key.t}]")
+
+    def lit(self, i) -> E:
+        if 0 <= i < len(self.lits):
+            return lit_expr(self.lits[i])
+        return E(f"lit{i}")
+
+    # ---------- exécution d'une instruction "simple" ----------
+    def exec(self, pc, out):
+        op = self.ops[pc]
+        _, a0, a1, a2, a3 = self.code[pc]
+        R = lambda r: self.read(r, pc)  # noqa: E731
+        W = lambda r, e: self.write(r, e, pc, out)  # noqa: E731
+
+        if op == "LINE":
+            return
+        if op == "LOAD":
+            W(a0, self.lit(a1))
+        elif op == "LOADINT":
+            W(a0, E(str(a1), atom=a1 >= 0, kind="int", meta=a1))
+        elif op == "LOADFLOAT":
+            W(a0, E(fmt_float(a1), kind="float"))
+        elif op == "DLOAD":
+            W(a0, self.lit(a1))
+            W(a2, self.lit(a3))
+        elif op == "LOADBOOL":
+            W(a0, E("true" if a1 else "false"))
+        elif op == "LOADNULLS":
+            for k in range(a1):
+                W(a0 + k, E("null"))
+        elif op == "LOADROOTTABLE":
+            W(a0, ROOT)
+        elif op == "MOVE":
+            W(a0, R(a1))
+        elif op == "DMOVE":
+            v1, v2 = R(a1), R(a3)
+            W(a0, v1)
+            W(a2, v2)
+        elif op in ("PREPCALL", "PREPCALLK"):
+            key = R(a1) if op == "PREPCALL" else self.lit(a1)
+            obj = R(a2)
+            self.regs[a3] = obj
+            if a3 in self.pending:
+                self.pending.remove(a3)
+            W(a0, E("", kind="callee", meta=(obj, key)))
+        elif op in ("CALL", "TAILCALL"):
+            callee = R(a1)
+            args = [R(a2 + k).t for k in range(1, a3)]
+            if callee.kind == "callee":
+                f = self.member(callee.meta[0], callee.meta[1], pc).t
+            else:
+                f = callee.p()
+            call = f"{f}({', '.join(args)})"
+            if op == "TAILCALL":
+                self.emit(out, ("line", f"return {call};"))
+            else:
+                W(a0, E(call, side=True))
+        elif op == "GETK":
+            W(a0, self.member(R(a2), self.lit(a1), pc))
+        elif op == "GET":
+            obj, key = R(a1), R(a2)
+            W(a0, self.member(obj, key, pc))
+        elif op == "SET":
+            obj, key, val = R(a1), R(a2), R(a3)
+            self.emit(out, ("line", f"{self.member(obj, key, pc).t} = {val.t};"))
+            if a0 != a3:
+                self.regs[a0] = val
+        elif op in ("NEWSLOT", "NEWSLOTA"):
+            obj, key, val = R(a1), R(a2), R(a3)
+            if obj.kind == "class":
+                obj.meta["members"].append((key, val, op == "NEWSLOTA" and (a0 & 2)))
+            elif obj.kind == "table":
+                obj.meta.append((key, val))
+                obj.t = self.table_txt(obj.meta)
+            elif obj.kind in ("this", "root") and key.kind == "str" and val.kind == "class":
+                self.emit(out, ("class", key.meta, val.meta))
+            elif obj.kind in ("this", "root") and key.kind == "str" and val.kind == "closure":
+                self.emit(out, ("func", key.meta, val.meta))
+            else:
+                tgt = self.member(obj, key, pc).t
+                self.emit(out, ("line", f"{tgt} <- {val.t};"))
+        elif op == "DELETE":
+            W(a0, E(f"delete {self.member(R(a1), R(a2), pc).t}", side=True))
+        elif op in ("EQ", "NE"):
+            right = self.lit(a1) if a3 else R(a1)
+            left = R(a2)
+            s = "==" if op == "EQ" else "!="
+            W(a0, binop(left, s, right, kind="cmp", meta=(op, left, right, a2)))
+        elif op == "ARITH":
+            b, a = R(a1), R(a2)
+            W(a0, binop(a, ARITH_OPS.get(a3, "+"), b))
+        elif op == "BITW":
+            b, a = R(a1), R(a2)
+            W(a0, binop(a, BITW_OPS.get(a3, "|"), b))
+        elif op == "CMP":
+            b, a = R(a1), R(a2)
+            W(a0, binop(a, CMP_OPS.get(a3, ">"), b))
+        elif op == "NOT":
+            W(a0, E(f"!{R(a1).p()}"))
+        elif op == "NEG":
+            W(a0, E(f"-{R(a1).p()}"))
+        elif op == "BWNOT":
+            W(a0, E(f"~{R(a1).p()}"))
+        elif op == "TYPEOF":
+            W(a0, E(f"typeof {R(a1).p()}", atom=False))
+        elif op == "CLONE":
+            W(a0, E(f"clone {R(a1).p()}", atom=False))
+        elif op == "EXISTS":
+            obj, key = R(a1), R(a2)
+            W(a0, binop(key, "in", obj))
+        elif op == "INSTANCEOF":
+            cls, o = R(a1), R(a2)
+            W(a0, binop(o, "instanceof", cls))
+        elif op == "NEWARRAY":
+            W(a0, E("[]", kind="array", meta=[]))
+        elif op == "APPENDARRAY":
+            arr = self.peek(a0, pc)
+            val = self.lit(a1) if a2 else R(a1)
+            if arr.kind == "array":
+                arr.meta.append(val.t)
+                arr.t = "[" + ", ".join(arr.meta) + "]"
+            else:
+                self.emit(out, ("line", f"{arr.p()}.append({val.t});"))
+        elif op == "NEWTABLE":
+            W(a0, E("{}", kind="table", meta=[]))
+        elif op == "CLOSURE":
+            W(a0, E(f"function_{a1}", kind="closure", meta=a1))
+        elif op == "CLASS":
+            base = R(a1) if a1 != -1 else None
+            W(a0, E("class", kind="class", meta={"base": base.t if base else None,
+                                                  "members": []}))
+        elif op in ("INCL", "PINCL"):
+            v = self.local_at(a1, pc)
+            n = v[0] if v else f"r{a1}"
+            sgn = "++" if a3 == 1 else ("--" if a3 in (255, -1) else None)
+            if sgn:
+                t = f"{sgn}{n}" if op == "INCL" else f"{n}{sgn}"
+            else:
+                t = f"{n} += {a3}"
+            W(a0, E(t, side=True))
+        elif op in ("INC", "PINC"):
+            obj, key = R(a1), R(a2)
+            m = self.member(obj, key, pc).t
+            sgn = "++" if a3 == 1 else "--"
+            W(a0, E(f"{sgn}{m}" if op == "INC" else f"{m}{sgn}", side=True))
+        elif op == "COMPARITHL":
+            v = self.local_at(a1, pc)
+            n = v[0] if v else f"r{a1}"
+            self.emit(out, ("line", f"{n} {ARITH_OPS.get(a3, '?')}= {R(a2).t};"))
+        elif op == "COMPARITH":
+            obj, key, val = R((a1 >> 16) & 0xFFFF), R(a2), R(a1 & 0xFFFF)
+            self.emit(out, ("line",
+                            f"{self.member(obj, key, pc).t} {ARITH_OPS.get(a3, '?')}= {val.t};"))
+        elif op == "GETPARENT":
+            W(a0, E(f"{R(a1).p()}.parent"))
+        elif op == "THROW":
+            self.emit(out, ("line", f"throw {R(a0).t};"))
+        else:
+            self.emit(out, ("line", f"/* {op} {a0} {a1} {a2} {a3} */"))
+
+    def table_txt(self, items):
+        parts = []
+        for k, v in items:
+            if k.kind == "str" and ident(k.meta):
+                parts.append(f"{k.meta} = {v.t}")
+            else:
+                parts.append(f"[{k.t}] = {v.t}")
+        return "{" + ", ".join(parts) + "}"
+
+    # ---------- && / || ----------
+    def logic(self, pc, out):
+        op = self.ops[pc]
+        _, a0, a1, a2, a3 = self.code[pc]
+        end = self.tgt(pc, a1)
+        first = self.read(a2, pc)
+        tmp = []
+        self.block_linear(pc + 1, end, tmp)
+        second = self.read(a0, end - 1)
+        if tmp:
+            for s in tmp:
+                self.emit(out, s)
+        s = "&&" if op == "AND" else "||"
+        self.write(a0, binop(first, s, second), pc, out)
+        return end
+
+    def block_linear(self, s, e, out):
+        pc = s
+        while pc < e:
+            if self.ops[pc] in ("AND", "OR"):
+                pc = self.logic(pc, out)
+                continue
+            self.exec(pc, out)
+            pc += 1
+
+    # ---------- structuration ----------
+    def declare(self, pc, out):
+        for nom, reg, st, en in self.locals:
+            if st == pc and pc > 0 and not self.is_param(nom) and nom != "this":
+                if en < st:
+                    self.flush(out)
+                    out.append(("line", f"// local {nom};  (déclarée en fin de bloc, sans code)"))
+                    continue
+                e = self.regs.pop(reg, None)
+                if reg in self.pending:
+                    self.pending.remove(reg)
+                self.flush(out)
+                if e is None or e.t == "null":
+                    out.append(("line", f"local {nom};"))
+                elif e.kind == "closure":
+                    out.append(("func", nom, e.meta, True))
+                else:
+                    out.append(("line", f"local {nom} = {e.t};"))
+
+    def is_case(self, jz, s):
+        """jz est-il un 'JZ' de case de switch sur le registre s ?"""
+        return (0 < jz < len(self.code) and self.ops[jz] == "JZ"
+                and self.ops[jz - 1] in ("EQ",) and self.code[jz - 1][3] == s
+                and self.code[jz - 1][1] == self.code[jz][1])
+
+    def try_switch(self, pc, e, ctx, out):
+        if not (pc > 0 and self.ops[pc - 1] == "EQ"):
+            return None
+        s = self.code[pc - 1][3]
+        cond = self.regs.get(self.code[pc][1])
+        t = self.tgt(pc, self.code[pc][2])
+        eq = self.code[pc - 1]
+        seul = eq[1] == eq[2] != eq[3] and not self.local_at(s, pc)
+        if not seul and eq[1] == eq[2] != eq[3] and self.ops[t - 1] == "JMP" \
+                and self.code[t - 1][2] >= 0:
+            # switch sur une locale à un seul case : une locale du case a une portée
+            # qui englobe le 'break' final (dans un if, elle s'arrêterait avant)
+            seul = any(pc < st < t - 1 and en == t - 1 for _, _, st, en in self.locals)
+        multi = False
+        if self.ops[t - 1] == "JMP" and self.code[t - 1][2] >= 0:
+            u = self.tgt(t - 1, self.code[t - 1][2])
+            multi = self.is_case(u - 1, s)
+        if not (multi or seul):
+            return None
+        # c'est un switch
+        cond = self.read(self.code[pc][1], pc)
+        subj = cond.meta[1] if cond and cond.kind == "cmp" else self.peek(s, pc)
+        val = cond.meta[2] if cond and cond.kind == "cmp" else E("?")
+        cases = []
+        jz = pc
+        while True:
+            t = self.tgt(jz, self.code[jz][2])
+            nxt = None
+            if self.ops[t - 1] == "JMP" and self.code[t - 1][2] >= 0:
+                u = self.tgt(t - 1, self.code[t - 1][2])
+                if self.is_case(u - 1, s):
+                    nxt = u - 1
+            cases.append([val, jz + 1, t - 1 if nxt is not None else t, nxt is not None])
+            if nxt is None:
+                break
+            tmp = []
+            self.block_linear(t, nxt, tmp)
+            c = self.read(self.code[nxt][1], nxt)
+            val = c.meta[2] if c.kind == "cmp" else E("?")
+            jz = nxt
+        t_last = self.tgt(jz, self.code[jz][2])
+        end = t_last
+        for i in range(pc, t_last):
+            if self.ops[i] == "JMP":
+                tt = self.tgt(i, self.code[i][2])
+                if t_last < tt <= e and (ctx.get("brk") is None or tt <= ctx["brk"]) \
+                        and tt != ctx.get("cont"):
+                    end = max(end, tt)
+        sub = dict(ctx, brk=end)
+        rendered = []
+        saved = dict(self.regs)
+        for v, bs, be, fall in cases:
+            self.regs = dict(saved)
+            body = self.block(bs, be, sub)
+            if fall and not (body and body[-1][0] == "line" and
+                             body[-1][1].split(" ")[0].rstrip(";") in
+                             ("break", "return", "continue")):
+                body.append(("line", "// fallthrough"))
+            rendered.append((v.t, body))
+        self.regs = dict(saved)
+        default = self.block(t_last, end, sub) if end > t_last else None
+        self.regs = dict(saved)
+        if not self.local_at(s, pc):
+            self.regs.pop(s, None)
+        self.emit(out, ("switch", subj.t, rendered, default))
+        return end
+
+    def a_envelopper(self, pc, fin_naturelle):
+        """Locale déclarée à pc dont la portée finit avant la fin du bloc -> { } isolé."""
+        best = None
+        for loc in self.locals:
+            nom, reg, st, en = loc
+            if st == pc and pc > 0 and loc not in self.wrapped and not self.is_param(nom) \
+                    and nom != "this" and pc <= en < fin_naturelle:
+                if best is None or en > best[3]:
+                    best = loc
+        return best
+
+    def block(self, s, e, ctx) -> list:
+        out = []
+        pc = s
+        fin_naturelle = e - 2 if (e == len(self.code) and self.ops[e - 1] == "RETURN") else e - 1
+        while pc < e:
+            loc = self.a_envelopper(pc, fin_naturelle)
+            if loc is not None:
+                self.wrapped.add(loc)
+                inner = self.block(pc, loc[3] + 1, ctx)
+                self.emit(out, ("block", inner))
+                pc = loc[3] + 1
+                continue
+            self.declare(pc, out)
+            # boucle ?
+            if pc in self.loops and pc != ctx.get("head") and self.loops[pc] < e:
+                pc = self.loop(pc, self.loops[pc], ctx, out)
+                continue
+            op = self.ops[pc]
+            _, a0, a1, a2, a3 = self.code[pc]
+            if op in ("AND", "OR"):
+                pc = self.logic(pc, out)
+                continue
+            if op in ("JZ", "JNZ"):
+                pc = self.cond(pc, e, ctx, out)
+                continue
+            if op == "JMP":
+                t = self.tgt(pc, a1)
+                if t == ctx.get("brk"):
+                    self.emit(out, ("line", "break;"))
+                elif t == ctx.get("cont"):
+                    self.emit(out, ("line", "continue;"))
+                else:
+                    self.emit(out, ("line", f"/* JMP -> {t} */"))
+                pc += 1
+                continue
+            if op == "RETURN":
+                if a0 == 255:
+                    if pc != len(self.code) - 1:
+                        self.emit(out, ("line", "return;"))
+                else:
+                    v = self.read(a1, pc)
+                    self.emit(out, ("line", f"return {v.t};"))
+                pc += 1
+                continue
+            self.exec(pc, out)
+            pc += 1
+        self.flush(out)
+        return out
+
+    def cond(self, pc, e, ctx, out):
+        op = self.ops[pc]
+        _, a0, a1, a2, a3 = self.code[pc]
+        t = self.tgt(pc, a1)
+        if op == "JZ":
+            sw = self.try_switch(pc, e, ctx, out)
+            if sw is not None:
+                return sw
+        c = self.read(a0, pc)
+        ctext = c.t if op == "JZ" else f"!{c.p()}"
+        if t <= pc or t > e:
+            if t == ctx.get("brk"):
+                self.emit(out, ("if", ctext if op == "JNZ" else f"!{c.p()}",
+                                [("line", "break;")], None))
+            else:
+                self.emit(out, ("line", f"/* if (!({ctext})) saut -> {t} */"))
+            return pc + 1
+        saved = dict(self.regs)
+        else_range = None
+        inner_owner = any(self.ops[k] in ("JZ", "JNZ") and self.tgt(k, self.code[k][2]) == t
+                          for k in range(pc + 1, t - 1))
+        if t - 1 > pc and self.ops[t - 1] == "JMP" and self.code[t - 1][2] >= 0 \
+                and not inner_owner:
+            u = self.tgt(t - 1, self.code[t - 1][2])
+            if u <= e and u != ctx.get("brk") and u != ctx.get("cont"):
+                else_range = (t, u)
+        self.flush(out)
+        then_end = t - 1 if else_range else t
+        then = self.block(pc + 1, then_end, ctx)
+        then_regs = self.regs
+        if else_range:
+            self.regs = dict(saved)
+            els = self.block(else_range[0], else_range[1], ctx)
+            else_regs = self.regs
+            # ternaire ?
+            if not then and not els:
+                for r in set(then_regs) & set(else_regs):
+                    if then_regs[r] is not saved.get(r) and else_regs[r] is not saved.get(r):
+                        self.regs = dict(saved)
+                        self.regs[r] = E(f"{c.p(1)} ? {then_regs[r].p(1)} : {else_regs[r].p(1)}",
+                                         prec=0)
+                        return else_range[1]
+            self.regs = dict(saved)
+            out.append(("if", ctext, then, els if els else [("empty",)]))
+            return else_range[1]
+        self.regs = dict(saved)
+        out.append(("if", ctext, then, None))
+        return t
+
+    def loop(self, h, bj, ctx, out):
+        self.flush(out)
+        kind = self.ops[bj]
+        if kind == "JNZ":
+            sub = dict(ctx, brk=bj + 1, cont=None, head=h)
+            body = self.block(h, bj, sub)
+            c = self.read(self.code[bj][1], bj)
+            out.append(("dowhile", c.t, body))
+            return bj + 1
+        # while : cherche le JZ de sortie
+        j, i = None, h
+        while i < bj:
+            o = self.ops[i]
+            if o in ("AND", "OR"):
+                i = self.tgt(i, self.code[i][2])
+                continue
+            if o == "JZ" and self.tgt(i, self.code[i][2]) == bj + 1:
+                j = i
+                break
+            if o in JUMPS or o in ("RETURN", "SET", "NEWSLOT", "COMPARITHL") or \
+                    i in self.loops and i != h:
+                break
+            i += 1
+        sub = dict(ctx, brk=bj + 1, cont=h, head=h)
+        if j is not None:
+            tmp = []
+            self.block_linear(h, j, tmp)
+            if not tmp:
+                c = self.read(self.code[j][1], j)
+                body = self.block(j + 1, bj, sub)
+                out.append(("while", c.t, body))
+                return bj + 1
+            self.regs = {}
+        body = self.block(h, bj, sub)
+        out.append(("while", "true", body))
+        return bj + 1
+
+    def run(self):
+        out = self.block(0, len(self.code), {})
+        return out
+
+
+# ====================== rendu ======================
+
+def params_txt(fn):
+    ps = [p[1].decode() for p in fn["param"] if p[0] == "str"]
+    ps = [p for p in ps if p != "this"]
+    if fn["vargs"]:
+        ps.append("...")
+    return ", ".join(ps)
+
+
+def render_fn(fn, name, ind, kw="function"):
+    head = f"{ind}{kw} {name}({params_txt(fn)})" if name else f"{ind}function({params_txt(fn)})"
+    try:
+        d = Decomp(fn, name or "")
+        stmts = d.run()
+        body = render(stmts, ind + "    ", fn)
+    except Exception as ex:  # repli : on ne cache rien
+        body = [f"{ind}    /* décompilation impossible ({ex}) : voir gsb_asm.py */"]
+    if not body:
+        return [head + " {}"]
+    return [head, ind + "{"] + body + [ind + "}"]
+
+
+def render(stmts, ind, fn):
+    L = []
+    for st in stmts:
+        k = st[0]
+        if k == "line":
+            L.append(ind + st[1])
+        elif k == "empty":
+            pass
+        elif k == "block":
+            L.append(ind + "{")
+            L += render(st[1], ind + "    ", fn)
+            L.append(ind + "}")
+        elif k == "if":
+            _, c, then, els = st
+            L.append(f"{ind}if ({c}) {{")
+            L += render(then, ind + "    ", fn)
+            while els:
+                if len(els) == 1 and els[0][0] == "if":
+                    _, c2, t2, e2 = els[0]
+                    L.append(f"{ind}}} else if ({c2}) {{")
+                    L += render(t2, ind + "    ", fn)
+                    els = e2
+                else:
+                    L.append(f"{ind}}} else {{")
+                    L += render(els, ind + "    ", fn)
+                    els = None
+            L.append(ind + "}")
+        elif k == "while":
+            L.append(f"{ind}while ({st[1]}) {{")
+            L += render(st[2], ind + "    ", fn)
+            L.append(ind + "}")
+        elif k == "dowhile":
+            L.append(f"{ind}do {{")
+            L += render(st[2], ind + "    ", fn)
+            L.append(f"{ind}}} while ({st[1]});")
+        elif k == "switch":
+            _, subj, cases, default = st
+            L.append(f"{ind}switch ({subj}) {{")
+            for v, body in cases:
+                L.append(f"{ind}    case {v}:")
+                L += render(body, ind + "        ", fn)
+            if default:
+                L.append(f"{ind}    default:")
+                L += render(default, ind + "        ", fn)
+            L.append(ind + "}")
+        elif k == "func":
+            nom, idx = st[1], st[2]
+            kw = "local function" if len(st) > 3 else "function"
+            L.append("")
+            L += render_fn(fn["fn"][idx], nom, ind, kw)
+        elif k == "class":
+            nom, meta = st[1], st[2]
+            L.append("")
+            base = f" extends {meta['base']}" if meta["base"] else ""
+            L.append(f"{ind}class {nom}{base}")
+            L.append(ind + "{")
+            for key, val, static in meta["members"]:
+                kn = key.meta if key.kind == "str" else key.t
+                pre = "static " if static else ""
+                if val.kind == "closure":
+                    L.append("")
+                    L += render_fn(fn["fn"][val.meta], kn, ind + "    ")
+                else:
+                    L.append(f"{ind}    {pre}{kn} = {val.t};")
+            L.append(ind + "}")
+    return L
+
+
+def parse_args(argv):
+    """Sépare l'option -o/--output des autres arguments."""
+    out, rest, i = None, [], 0
+    while i < len(argv):
+        if argv[i] in ("-o", "--output"):
+            if i + 1 >= len(argv):
+                sys.exit("erreur : -o attend un chemin")
+            out = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    return rest, out
+
+
+def sortie_defaut(src: Path, ext: str) -> Path:
+    """Sortie par défaut dans le dossier courant : fichier -> nom.ext, dossier -> nom_ext/"""
+    if src.is_dir():
+        return Path.cwd() / f"{src.resolve().name}_{ext.lstrip('.')}"
+    return Path.cwd() / (src.stem + ext)
+
+def decompile(data: bytes, nom: str) -> str:
+    main = lire_gsb(data)
+    d = Decomp(main, "main")
+    stmts = d.run()
+    lines = [f"// {nom} : décompilé depuis le bytecode Squirrel 2 par gsb_decompile.py", ""]
+    lines += render(stmts, "", main)
+    return "\n".join(lines).replace("\n\n\n", "\n\n").strip() + "\n"
+
+
+def main():
+    a, out = parse_args(sys.argv[1:])
+    if len(a) != 1:
+        print(__doc__)
+        print("Option : -o CHEMIN  (-o - pour afficher ; sinon : dossier courant, nom.nut)")
+        sys.exit(1)
+    src = Path(a[0])
+    if src.is_dir():
+        dst = Path(out) if out else sortie_defaut(src, ".nut")
+        n = 0
+        for fp in sorted(src.rglob("*.gsb")):
+            cible = dst / fp.relative_to(src).with_suffix(".nut")
+            cible.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                cible.write_text(decompile(fp.read_bytes(), fp.name), "utf-8")
+                n += 1
+            except Exception as e:
+                print(f"[ERREUR] {fp} : {e}")
+        print(f"{n} fichiers décompilés dans {dst}/")
+    else:
+        txt = decompile(src.read_bytes(), src.name)
+        if out == "-":
+            print(txt)
+            return
+        dst = Path(out) if out else sortie_defaut(src, ".nut")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(txt, "utf-8")
+        print(f"-> {dst}")
+
+
+if __name__ == "__main__":
+    main()

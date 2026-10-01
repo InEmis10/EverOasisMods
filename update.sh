@@ -1,0 +1,1 @@
+cp ../tool/* -r ./binary

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Construit "sqc" : compilateur Squirrel 2.2.4 -> bytecode .gsb (format Ever Oasis).
+# Prérequis Fedora : sudo dnf install git gcc-c++
+# Usage : bash build_sqc.sh        (crée ./sqc)
+#         ./sqc VendorNpc.nut VendorNpc.gsb
+set -euo pipefail
+ 
+DIR="$(cd "$(dirname "$0")" && pwd)"
+WORK="$DIR/.sqc_build"
+rm -rf "$WORK"
+git clone --depth 1 https://github.com/nikvoid/squirrel2-kaleido-rs "$WORK/src" >/dev/null 2>&1
+SQ="$WORK/src/sq2"
+ 
+# 1) entiers Squirrel en 32 bits (comme sur 3DS), même sur un PC 64 bits
+python3 - "$SQ" <<'EOF'
+import sys
+sq = sys.argv[1]
+p = f"{sq}/include/squirrel.h"
+s = open(p).read()
+s = s.replace("#if (defined(_WIN64) || defined(_LP64))\n#define _SQ64\n#endif",
+              "/* sqc : SQInteger 32 bits comme sur 3DS */")
+s = s.replace("typedef unsigned int SQHash; /*should be the same size of a pointer*/",
+              "typedef unsigned long SQHash; /*should be the same size of a pointer*/")
+open(p, "w").write(s)
+p = f"{sq}/squirrel/sqtable.h"
+s = open(p).read()
+s = s.replace("#define hashptr(p)  ((SQHash)(((SQInteger)p) >> 3))",
+              "#define hashptr(p)  ((SQHash)(((size_t)p) >> 3))")
+open(p, "w").write(s)
+EOF
+ 
+# 2) petit programme : compile un .nut et écrit le bytecode sérialisé
+cat > "$WORK/sqc.cpp" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include "squirrel.h"
+static SQInteger wr(SQUserPointer up, SQUserPointer p, SQInteger n){ return (SQInteger)fwrite(p,1,n,(FILE*)up); }
+static void pf(HSQUIRRELVM, const SQChar* s, ...){ va_list a; va_start(a,s); vfprintf(stderr,s,a); va_end(a); }
+static void cerr(HSQUIRRELVM, const SQChar* d, const SQChar* src, SQInteger line, SQInteger col){
+  fprintf(stderr, "ligne %d, colonne %d : erreur : %s\n", (int)line, (int)col, d); }
+int main(int argc, char** argv){
+  if(argc!=3){ fprintf(stderr,"usage: sqc source.nut sortie.gsb\n"); return 1; }
+  FILE* f=fopen(argv[1],"rb"); if(!f){ perror(argv[1]); return 1; }
+  fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+  char* b=(char*)malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){ perror("lecture"); return 1; } fclose(f);
+  HSQUIRRELVM v=sq_open(1024); sq_setprintfunc(v,pf); sq_setcompilererrorhandler(v,cerr);
+  if(SQ_FAILED(sq_compilebuffer(v,b,n,"",SQTrue))) return 2;
+  FILE* o=fopen(argv[2],"wb"); if(!o){ perror(argv[2]); return 1; }
+  if(SQ_FAILED(sq_writeclosure(v,wr,o))){ fprintf(stderr,"échec de la sérialisation\n"); return 3; }
+  fclose(o); sq_close(v); return 0; }
+EOF
+ 
+g++ -std=gnu++11 -O1 -w -fpermissive -fno-strict-aliasing -I"$SQ/include" -I"$SQ/squirrel" \
+    "$SQ"/squirrel/*.cpp "$WORK/sqc.cpp" -o "$DIR/sqc"
+rm -rf "$WORK"
+echo "OK : $DIR/sqc"
+
